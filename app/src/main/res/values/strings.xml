@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Horizon</string>
+    <string name="accessibility_desc">Horizon autonomous controller enables your AI models to assist you by performing tappings, swipes, and navigating screens on your device based on your configured prompt targets.</string>
+</resources>
