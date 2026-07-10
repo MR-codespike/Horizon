@@ -327,7 +327,15 @@ class KeyManager(context: Context) {
     private val prefs = context.getSharedPreferences("horizon_prefs", Context.MODE_PRIVATE)
 
     fun getApiKey(provider: ApiProvider): String {
-        return prefs.getString("key_${provider.name}", "") ?: ""
+        val savedKey = prefs.getString("key_${provider.name}", "") ?: ""
+        if (savedKey.isNotEmpty()) {
+            return savedKey
+        }
+        return if (provider == ApiProvider.GEMINI) {
+            com.example.BuildConfig.GEMINI_API_KEY
+        } else {
+            ""
+        }
     }
 
     fun saveApiKey(provider: ApiProvider, key: String) {
@@ -336,6 +344,18 @@ class KeyManager(context: Context) {
 
     fun clearApiKey(provider: ApiProvider) {
         prefs.edit().remove("key_${provider.name}").apply()
+    }
+
+    fun getCustomModel(provider: ApiProvider): String {
+        return prefs.getString("custom_model_${provider.name}", "") ?: ""
+    }
+
+    fun saveCustomModel(provider: ApiProvider, modelName: String) {
+        prefs.edit().putString("custom_model_${provider.name}", modelName).apply()
+    }
+
+    fun clearCustomModel(provider: ApiProvider) {
+        prefs.edit().remove("custom_model_${provider.name}").apply()
     }
 
     fun isVoiceWakeEnabled(): Boolean {
@@ -358,6 +378,9 @@ data class ChatUiState(
     val geminiKey: String = "",
     val openRouterKey: String = "",
     val huggingFaceKey: String = "",
+    val geminiCustomModel: String = "",
+    val openRouterCustomModel: String = "",
+    val huggingFaceCustomModel: String = "",
     val currentRequestLog: String? = null,
     
     // Agent-specific States
@@ -385,10 +408,21 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
         _uiState.update { state ->
             val voiceEnabled = keyManager.isVoiceWakeEnabled()
             DeviceControlService.isVoiceWakeEnabled = voiceEnabled
+            val geminiCustom = keyManager.getCustomModel(ApiProvider.GEMINI)
+            val openRouterCustom = keyManager.getCustomModel(ApiProvider.OPEN_ROUTER)
+            val hfCustom = keyManager.getCustomModel(ApiProvider.HUGGING_FACE)
             state.copy(
                 geminiKey = keyManager.getApiKey(ApiProvider.GEMINI),
                 openRouterKey = keyManager.getApiKey(ApiProvider.OPEN_ROUTER),
                 huggingFaceKey = keyManager.getApiKey(ApiProvider.HUGGING_FACE),
+                geminiCustomModel = geminiCustom,
+                openRouterCustomModel = openRouterCustom,
+                huggingFaceCustomModel = hfCustom,
+                customModelInput = when (state.selectedProvider) {
+                    ApiProvider.GEMINI -> geminiCustom
+                    ApiProvider.OPEN_ROUTER -> openRouterCustom
+                    ApiProvider.HUGGING_FACE -> hfCustom
+                },
                 isVoiceWakeEnabled = voiceEnabled
             )
         }
@@ -472,10 +506,15 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
     fun setProvider(provider: ApiProvider) {
         _uiState.update { state ->
             val defaultModel = modelOptions.firstOrNull { it.provider == provider }?.id ?: ""
+            val savedCustomModel = when (provider) {
+                ApiProvider.GEMINI -> state.geminiCustomModel
+                ApiProvider.OPEN_ROUTER -> state.openRouterCustomModel
+                ApiProvider.HUGGING_FACE -> state.huggingFaceCustomModel
+            }
             state.copy(
                 selectedProvider = provider,
-                selectedModel = defaultModel,
-                customModelInput = ""
+                selectedModel = if (savedCustomModel.isNotEmpty()) "custom" else defaultModel,
+                customModelInput = savedCustomModel
             )
         }
     }
@@ -485,7 +524,48 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
     }
 
     fun setCustomModelInput(customModel: String) {
-        _uiState.update { it.copy(customModelInput = customModel) }
+        val provider = _uiState.value.selectedProvider
+        keyManager.saveCustomModel(provider, customModel)
+        _uiState.update { state ->
+            val updatedState = state.copy(customModelInput = customModel)
+            when (provider) {
+                ApiProvider.GEMINI -> updatedState.copy(geminiCustomModel = customModel)
+                ApiProvider.OPEN_ROUTER -> updatedState.copy(openRouterCustomModel = customModel)
+                ApiProvider.HUGGING_FACE -> updatedState.copy(huggingFaceCustomModel = customModel)
+            }
+        }
+    }
+
+    fun updateCustomModel(provider: ApiProvider, customModel: String) {
+        keyManager.saveCustomModel(provider, customModel)
+        _uiState.update { state ->
+            val updatedState = when (provider) {
+                ApiProvider.GEMINI -> state.copy(geminiCustomModel = customModel)
+                ApiProvider.OPEN_ROUTER -> state.copy(openRouterCustomModel = customModel)
+                ApiProvider.HUGGING_FACE -> state.copy(huggingFaceCustomModel = customModel)
+            }
+            if (updatedState.selectedProvider == provider) {
+                updatedState.copy(customModelInput = customModel)
+            } else {
+                updatedState
+            }
+        }
+    }
+
+    fun clearCustomModel(provider: ApiProvider) {
+        keyManager.clearCustomModel(provider)
+        _uiState.update { state ->
+            val updatedState = when (provider) {
+                ApiProvider.GEMINI -> state.copy(geminiCustomModel = "")
+                ApiProvider.OPEN_ROUTER -> state.copy(openRouterCustomModel = "")
+                ApiProvider.HUGGING_FACE -> state.copy(huggingFaceCustomModel = "")
+            }
+            if (updatedState.selectedProvider == provider) {
+                updatedState.copy(customModelInput = "")
+            } else {
+                updatedState
+            }
+        }
     }
 
     fun updateKey(provider: ApiProvider, key: String) {
@@ -1169,8 +1249,8 @@ fun BYOKPlaygroundScreen(
                         color = MaterialTheme.colorScheme.onSurface
                     )
 
-                    // 1. Google AI Studio Key
-                    Column {
+                    // 1. Google AI Studio Key & Custom Model
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Google AI Studio (Gemini)", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -1206,10 +1286,37 @@ fun BYOKPlaygroundScreen(
                                 }
                             }
                         }
+                        OutlinedTextField(
+                            value = uiState.geminiCustomModel,
+                            onValueChange = { viewModel.updateCustomModel(ApiProvider.GEMINI, it) },
+                            placeholder = { Text("Default: gemini-2.5-flash") },
+                            label = { Text("Custom Model Override", fontSize = 10.sp) },
+                            textStyle = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("gemini_custom_model_settings_input"),
+                            singleLine = true,
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Build,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            },
+                            trailingIcon = {
+                                if (uiState.geminiCustomModel.isNotEmpty()) {
+                                    IconButton(onClick = { viewModel.clearCustomModel(ApiProvider.GEMINI) }) {
+                                        Icon(Icons.Default.Clear, contentDescription = "Clear Custom Model")
+                                    }
+                                }
+                            }
+                        )
                     }
 
-                    // 2. OpenRouter Key
-                    Column {
+                    // 2. OpenRouter Key & Custom Model
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("OpenRouter Key", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -1245,10 +1352,37 @@ fun BYOKPlaygroundScreen(
                                 }
                             }
                         }
+                        OutlinedTextField(
+                            value = uiState.openRouterCustomModel,
+                            onValueChange = { viewModel.updateCustomModel(ApiProvider.OPEN_ROUTER, it) },
+                            placeholder = { Text("Default: google/gemini-2.5-flash:free") },
+                            label = { Text("Custom Model Override", fontSize = 10.sp) },
+                            textStyle = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("openrouter_custom_model_settings_input"),
+                            singleLine = true,
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Build,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            },
+                            trailingIcon = {
+                                if (uiState.openRouterCustomModel.isNotEmpty()) {
+                                    IconButton(onClick = { viewModel.clearCustomModel(ApiProvider.OPEN_ROUTER) }) {
+                                        Icon(Icons.Default.Clear, contentDescription = "Clear Custom Model")
+                                    }
+                                }
+                            }
+                        )
                     }
 
-                    // 3. Hugging Face Access Token
-                    Column {
+                    // 3. Hugging Face Access Token & Custom Model
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Hugging Face Access Token", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -1284,6 +1418,33 @@ fun BYOKPlaygroundScreen(
                                 }
                             }
                         }
+                        OutlinedTextField(
+                            value = uiState.huggingFaceCustomModel,
+                            onValueChange = { viewModel.updateCustomModel(ApiProvider.HUGGING_FACE, it) },
+                            placeholder = { Text("Default: meta-llama/Llama-3.2-3B-Instruct") },
+                            label = { Text("Custom Model Override", fontSize = 10.sp) },
+                            textStyle = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("huggingface_custom_model_settings_input"),
+                            singleLine = true,
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Build,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            },
+                            trailingIcon = {
+                                if (uiState.huggingFaceCustomModel.isNotEmpty()) {
+                                    IconButton(onClick = { viewModel.clearCustomModel(ApiProvider.HUGGING_FACE) }) {
+                                        Icon(Icons.Default.Clear, contentDescription = "Clear Custom Model")
+                                    }
+                                }
+                            }
+                        )
                     }
 
                     Button(
@@ -1389,7 +1550,7 @@ fun BYOKPlaygroundScreen(
 
             Box(modifier = Modifier.fillMaxWidth()) {
                 OutlinedTextField(
-                    value = selectedModelOption?.displayName ?: "Custom Model Input...",
+                    value = selectedModelOption?.displayName ?: if (uiState.customModelInput.isNotEmpty()) "Custom: ${uiState.customModelInput}" else "Custom Model Input...",
                     onValueChange = {},
                     readOnly = true,
                     modifier = Modifier
