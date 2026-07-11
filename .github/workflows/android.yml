@@ -38,8 +38,8 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           # No Gradle wrapper is committed in this project, so setup-gradle can't infer
-          # a version from gradlew. AGP 9.1.1 hard-requires Gradle 9.1.0+, so pin explicitly.
-          gradle-version: '9.1.0'
+          # a version from gradlew. AGP 9.1.1 hard-requires Gradle 9.3.1+, so pin explicitly.
+          gradle-version: '9.3.1'
 
       - name: Restore Debug Keystore
         run: |
