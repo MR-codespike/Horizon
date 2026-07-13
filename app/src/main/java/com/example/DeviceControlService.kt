@@ -2,8 +2,13 @@ package com.example
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
+import android.hardware.HardwareBuffer
+import android.os.Build
+import android.util.Base64
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.speech.SpeechRecognizer
@@ -16,6 +21,10 @@ import android.os.Looper
 import android.os.PowerManager
 import android.content.Context
 import android.widget.Toast
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
 
 object VoiceTriggerManager {
     var onVoiceCommandReceived: ((String) -> Unit)? = null
@@ -208,6 +217,68 @@ class DeviceControlService : AccessibilityService() {
         traverseAndSerialize(root, 0, sb)
         root.recycle()
         return sb.toString()
+    }
+
+    /**
+     * Captures a screenshot of the current screen and returns it as a base64-encoded JPEG string,
+     * suitable for sending to a vision-capable model alongside the text accessibility tree.
+     *
+     * Requires API 30+ (Android 11). On older devices, returns null so callers can fall back
+     * to text-only mode without breaking the agent loop.
+     *
+     * This is a blocking call (waits up to 3 seconds for the async screenshot callback) so it
+     * can be used inline in the existing synchronous agent step flow.
+     */
+    fun captureScreenshotBase64(): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            Log.w("Horizon", "Screenshot capture requires Android 11+ (API 30). Skipping.")
+            return null
+        }
+
+        val latch = CountDownLatch(1)
+        var resultBase64: String? = null
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            takeScreenshot(
+                android.view.Display.DEFAULT_DISPLAY,
+                executor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        try {
+                            val hardwareBuffer: HardwareBuffer = screenshot.hardwareBuffer
+                            val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
+                            if (bitmap != null) {
+                                // Hardware bitmaps can't be compressed directly; copy to a software bitmap first.
+                                val softwareBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                val stream = ByteArrayOutputStream()
+                                softwareBitmap.compress(Bitmap.CompressFormat.JPEG, 80, stream)
+                                resultBase64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+                                softwareBitmap.recycle()
+                                bitmap.recycle()
+                            }
+                            hardwareBuffer.close()
+                        } catch (e: Exception) {
+                            Log.e("Horizon", "Failed to process screenshot buffer: ${e.message}")
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        Log.e("Horizon", "takeScreenshot failed with error code: $errorCode")
+                        latch.countDown()
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            Log.e("Horizon", "Exception calling takeScreenshot: ${e.message}")
+            latch.countDown()
+        }
+
+        latch.await(3, TimeUnit.SECONDS)
+        executor.shutdown()
+        return resultBase64
     }
 
     private fun traverseAndSerialize(node: AccessibilityNodeInfo?, depth: Int, sb: StringBuilder) {
