@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
@@ -46,7 +47,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.launch
 import com.example.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -125,7 +128,7 @@ object ApiClient {
         prompt: String,
         apiKey: String,
         imageBase64: String? = null,
-        onResponse: (success: Boolean, text: String, latencyMs: Long, endpointUrl: String, debugJson: String) -> Unit
+        onResponse: (success: Boolean, text: String, latencyMs: Long, endpointUrl: String, debugJson: String, httpCode: Int) -> Unit
     ) {
         val startTime = System.currentTimeMillis()
         val requestBuilder = Request.Builder()
@@ -223,7 +226,7 @@ object ApiClient {
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     val latency = System.currentTimeMillis() - startTime
-                    onResponse(false, "Network connection error: ${e.message}\nPlease check your internet connection.", latency, url, "Error: ${e.localizedMessage}")
+                    onResponse(false, "Network connection error: ${e.message}\nPlease check your internet connection.", latency, url, "Error: ${e.localizedMessage}", -1)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -234,9 +237,9 @@ object ApiClient {
                     if (response.isSuccessful) {
                         try {
                             val responseText = extractText(provider, responseBody)
-                            onResponse(true, responseText, latency, url, responseBody)
+                            onResponse(true, responseText, latency, url, responseBody, code)
                         } catch (e: Exception) {
-                            onResponse(false, "Failed to parse API response. Status: $code. Error: ${e.message}", latency, url, responseBody)
+                            onResponse(false, "Failed to parse API response. Status: $code. Error: ${e.message}", latency, url, responseBody, code)
                         }
                     } else {
                         val parsedError = try {
@@ -250,14 +253,15 @@ object ApiClient {
                             "API returned HTTP error code $code.$errorSuffix",
                             latency,
                             url,
-                            responseBody
+                            responseBody,
+                            code
                         )
                     }
                 }
             })
         } catch (e: Exception) {
             val latency = System.currentTimeMillis() - startTime
-            onResponse(false, "Preparation error: ${e.message}", latency, url, "Exception during request setup: ${e.localizedMessage}")
+            onResponse(false, "Preparation error: ${e.message}", latency, url, "Exception during request setup: ${e.localizedMessage}", -1)
         }
     }
 
@@ -423,9 +427,14 @@ data class ChatUiState(
     val simulatorVolumeLevel: Int = 50
 )
 
-class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
+class ChatViewModel(private val keyManager: KeyManager, private val appContext: Context) : ViewModel() {
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+    private val taskHistoryDao = AppDatabase.getInstance(appContext).taskHistoryDao()
+    private var currentTaskHistoryId: Long? = null
+
+    val taskHistory = taskHistoryDao.getAllTasks()
 
     init {
         _uiState.update { state ->
@@ -613,16 +622,36 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
         }
     }
 
+    private fun keyFor(state: ChatUiState, provider: ApiProvider): String {
+        return when (provider) {
+            ApiProvider.GEMINI -> state.geminiKey
+            ApiProvider.OPEN_ROUTER -> state.openRouterKey
+            ApiProvider.HUGGING_FACE -> state.huggingFaceKey
+        }
+    }
+
+    private fun defaultModelFor(provider: ApiProvider): String {
+        return modelOptions.firstOrNull { it.provider == provider }?.id ?: ""
+    }
+
+    /**
+     * Returns the next provider (in a fixed priority order) that has a non-empty API key
+     * configured and hasn't already been tried in the current failover attempt, or null if
+     * every configured provider has been exhausted.
+     */
+    private fun nextFallbackProvider(state: ChatUiState, alreadyTried: Set<ApiProvider>): ApiProvider? {
+        val priorityOrder = listOf(ApiProvider.GEMINI, ApiProvider.OPEN_ROUTER, ApiProvider.HUGGING_FACE)
+        return priorityOrder.firstOrNull { provider ->
+            provider !in alreadyTried && keyFor(state, provider).trim().isNotEmpty()
+        }
+    }
+
     fun sendMessage(prompt: String) {
         if (prompt.trim().isEmpty()) return
 
         val state = _uiState.value
         val activeProvider = state.selectedProvider
-        val apiKey = when (activeProvider) {
-            ApiProvider.GEMINI -> state.geminiKey
-            ApiProvider.OPEN_ROUTER -> state.openRouterKey
-            ApiProvider.HUGGING_FACE -> state.huggingFaceKey
-        }
+        val apiKey = keyFor(state, activeProvider)
 
         if (apiKey.trim().isEmpty()) {
             val errorMsg = Message(
@@ -634,43 +663,63 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
             return
         }
 
-        val activeModel = if (state.selectedModel == "custom") {
-            if (state.customModelInput.trim().isEmpty()) {
-                val errorMsg = Message(
-                    role = "assistant",
-                    content = "Error: 'Custom Model' is selected but model ID is blank. Please enter a valid identifier.",
-                    isError = true
-                )
-                _uiState.update { it.copy(messages = it.messages + Message(role = "user", content = prompt) + errorMsg) }
-                return
-            }
-            state.customModelInput.trim()
-        } else {
-            state.selectedModel
-        }
-
         val userMsg = Message(role = "user", content = prompt)
         _uiState.update { it.copy(
             messages = it.messages + userMsg,
             isLoading = true,
-            currentRequestLog = "Dispatching HTTP POST request to $activeModel via ${activeProvider.displayName} API..."
+            currentRequestLog = "Dispatching HTTP POST request via ${activeProvider.displayName} API..."
         ) }
 
-        ApiClient.sendRequest(activeProvider, activeModel, prompt, apiKey) { success, responseText, latency, url, debugJson ->
+        sendMessageWithFailover(prompt, activeProvider, triedProviders = emptySet())
+    }
+
+    /**
+     * Sends a chat prompt using the given provider, automatically retrying with the next
+     * provider that has a configured key if this one returns HTTP 429 (quota/rate-limit
+     * exhausted). Stops and surfaces an error once every configured provider has been tried.
+     */
+    private fun sendMessageWithFailover(prompt: String, provider: ApiProvider, triedProviders: Set<ApiProvider>) {
+        val state = _uiState.value
+        val apiKey = keyFor(state, provider)
+        val activeModel = if (state.selectedProvider == provider && state.selectedModel == "custom") {
+            state.customModelInput.trim().ifEmpty { defaultModelFor(provider) }
+        } else if (state.selectedProvider == provider) {
+            state.selectedModel
+        } else {
+            // Fell back to a different provider than the one selected in the UI; use its default model.
+            defaultModelFor(provider)
+        }
+
+        val nowTried = triedProviders + provider
+
+        ApiClient.sendRequest(provider, activeModel, prompt, apiKey) { success, responseText, latency, url, debugJson, httpCode ->
+            if (!success && httpCode == 429) {
+                val fallback = nextFallbackProvider(state, nowTried)
+                if (fallback != null) {
+                    _uiState.update { it.copy(
+                        currentRequestLog = "⚠️ ${provider.displayName} quota exhausted (429). Automatically switching to ${fallback.displayName}..."
+                    ) }
+                    sendMessageWithFailover(prompt, fallback, nowTried)
+                    return@sendRequest
+                }
+            }
+
             val assistantMsg = Message(
                 role = "assistant",
-                content = responseText,
+                content = if (!success && httpCode == 429)
+                    "$responseText\n\nAll configured providers (${nowTried.joinToString { it.displayName }}) are currently rate-limited or out of quota."
+                else responseText,
                 isError = !success,
-                provider = activeProvider.displayName,
+                provider = provider.displayName,
                 model = activeModel,
                 latencyMs = latency,
                 endpointUrl = url
             )
 
             val log = """
-                PROVIDER: ${activeProvider.displayName}
+                PROVIDER: ${provider.displayName}
                 MODEL ID: $activeModel
-                HTTP STATUS: ${if (success) "200 Success" else "Error"}
+                HTTP STATUS: ${if (success) "200 Success" else "Error ($httpCode)"}
                 ROUND-TRIP LATENCY: ${latency}ms
                 ENDPOINT URL: $url
                 
@@ -702,38 +751,74 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
             agentLogs = listOf("🏁 Starting autonomous session for goal: \"$goal\"")
         ) }
 
+        viewModelScope.launch {
+            val id = taskHistoryDao.insert(
+                TaskHistoryEntity(
+                    goal = goal,
+                    status = TaskStatus.RUNNING,
+                    startedAt = System.currentTimeMillis(),
+                    wasSimulator = _uiState.value.isSimulatorMode
+                )
+            )
+            currentTaskHistoryId = id
+        }
+
         runAgentStep()
     }
 
     fun stopAgent() {
         _uiState.update { it.copy(isAgentRunning = false, agentLogs = it.agentLogs + "⏸️ Agent session paused by user.") }
+        finalizeTaskHistory(TaskStatus.STOPPED, "Stopped by user.")
     }
 
-    private fun runAgentStep() {
+    /**
+     * Marks the currently-tracked task history row (if any) as finished with the given
+     * status and result message, then clears the tracker so a stray late callback can't
+     * overwrite a run that's already been finalized.
+     */
+    private fun finalizeTaskHistory(status: String, resultMessage: String?) {
+        val id = currentTaskHistoryId ?: return
+        currentTaskHistoryId = null
+        val stepCount = _uiState.value.agentLogs.count { it.startsWith("👉") }
+        viewModelScope.launch {
+            val existing = taskHistoryDao.getTaskById(id) ?: return@launch
+            taskHistoryDao.update(
+                existing.copy(
+                    status = status,
+                    endedAt = System.currentTimeMillis(),
+                    stepCount = stepCount,
+                    resultMessage = resultMessage
+                )
+            )
+        }
+    }
+
+    private fun runAgentStep(overrideProvider: ApiProvider? = null, triedProviders: Set<ApiProvider> = emptySet()) {
         val state = _uiState.value
         if (!state.isAgentRunning) return
 
-        val activeProvider = state.selectedProvider
-        val apiKey = when (activeProvider) {
-            ApiProvider.GEMINI -> state.geminiKey
-            ApiProvider.OPEN_ROUTER -> state.openRouterKey
-            ApiProvider.HUGGING_FACE -> state.huggingFaceKey
-        }
+        val activeProvider = overrideProvider ?: state.selectedProvider
+        val apiKey = keyFor(state, activeProvider)
 
         if (apiKey.trim().isEmpty()) {
             _uiState.update { it.copy(
                 isAgentRunning = false,
                 agentLogs = it.agentLogs + "❌ Error: API Key is missing for ${activeProvider.displayName}. Stopping loop."
             ) }
+            finalizeTaskHistory(TaskStatus.FAILED, "API key missing for ${activeProvider.displayName}.")
             return
         }
 
-        val activeModel = if (state.selectedModel == "custom") {
+        val activeModel = if (overrideProvider != null) {
+            // Fell back to a different provider than the one selected in the UI; use its default model.
+            defaultModelFor(activeProvider)
+        } else if (state.selectedModel == "custom") {
             if (state.customModelInput.trim().isEmpty()) {
                 _uiState.update { it.copy(
                     isAgentRunning = false,
                     agentLogs = it.agentLogs + "❌ Error: Custom model ID is blank. Stopping loop."
                 ) }
+                finalizeTaskHistory(TaskStatus.FAILED, "Custom model ID was blank.")
                 return
             }
             state.customModelInput.trim()
@@ -790,15 +875,30 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
             - If no element in the tree matches what you need, do not guess a coordinate — instead use [WAIT: 1] or [BACK] and explain why in your thought.
         """.trimIndent()
 
-        ApiClient.sendRequest(activeProvider, activeModel, finalPrompt, apiKey, screenshotBase64) { success, responseText, latency, url, debugJson ->
+        val nowTried = triedProviders + activeProvider
+
+        ApiClient.sendRequest(activeProvider, activeModel, finalPrompt, apiKey, screenshotBase64) { success, responseText, latency, url, debugJson, httpCode ->
             val currentState = _uiState.value
             if (!currentState.isAgentRunning) return@sendRequest // Stopped in transition
 
+            if (!success && httpCode == 429) {
+                val fallback = nextFallbackProvider(currentState, nowTried)
+                if (fallback != null) {
+                    _uiState.update { it.copy(
+                        agentLogs = it.agentLogs + "⚠️ ${activeProvider.displayName} quota exhausted (429). Automatically switching to ${fallback.displayName} and retrying this step..."
+                    ) }
+                    runAgentStep(overrideProvider = fallback, triedProviders = nowTried)
+                    return@sendRequest
+                }
+            }
+
             if (!success) {
+                val quotaNote = if (httpCode == 429) " All configured providers (${nowTried.joinToString { it.displayName }}) are rate-limited or out of quota." else ""
                 _uiState.update { it.copy(
                     isAgentRunning = false,
-                    agentLogs = it.agentLogs + "❌ Error calling API: $responseText. Session paused."
+                    agentLogs = it.agentLogs + "❌ Error calling API: $responseText.$quotaNote Session paused."
                 ) }
+                finalizeTaskHistory(TaskStatus.FAILED, "API error: $responseText$quotaNote")
                 return@sendRequest
             }
 
@@ -829,6 +929,9 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
 
             if (isComplete) {
                 _uiState.update { it.copy(agentLogs = it.agentLogs + "🎉 Task Completed successfully!") }
+                val completeMatch = Regex("\\[COMPLETE:\\s*\"([^\"]*)\"\\]").find(actionText)
+                val completionMsg = completeMatch?.groupValues?.get(1) ?: "Task completed."
+                finalizeTaskHistory(TaskStatus.COMPLETED, completionMsg)
             } else if (_uiState.value.isAgentRunning) {
                 // Wait 3.5 seconds and trigger the next step
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
@@ -1171,9 +1274,9 @@ fun BYOKPlaygroundScreen(
     keyManager: KeyManager,
     modifier: Modifier = Modifier
 ) {
-    val viewModel: ChatViewModel = viewModel { ChatViewModel(keyManager) }
-    val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
+    val viewModel: ChatViewModel = viewModel { ChatViewModel(keyManager, context.applicationContext) }
+    val uiState by viewModel.uiState.collectAsState()
     val clipboardManager = LocalClipboardManager.current
     val focusManager = LocalFocusManager.current
 
@@ -2031,6 +2134,8 @@ fun PhoneControlAgentPanel(
     val context = LocalContext.current
     var isRealEnabled = DeviceControlService.isEnabled()
     val scrollState = rememberLazyListState()
+    var showHistoryDialog by remember { mutableStateOf(false) }
+    val taskHistory by viewModel.taskHistory.collectAsState(initial = emptyList())
 
     val agentSpeechLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -2069,6 +2174,19 @@ fun PhoneControlAgentPanel(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(bottom = 24.dp)
     ) {
+        // 0. History Button
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(onClick = { showHistoryDialog = true }) {
+                    Icon(Icons.Filled.History, contentDescription = "Task history")
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("History")
+                }
+            }
+        }
         // 1. Connection & Mode Status Bar
         item {
             Card(
@@ -2904,6 +3022,103 @@ fun PhoneControlAgentPanel(
                                 else -> MaterialTheme.colorScheme.onSurface
                             }
                         )
+                    }
+                }
+            }
+        }
+    }
+
+    if (showHistoryDialog) {
+        Dialog(onDismissRequest = { showHistoryDialog = false }) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(0.8f),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Task History",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        IconButton(onClick = { showHistoryDialog = false }) {
+                            Icon(Icons.Filled.Close, contentDescription = "Close")
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    if (taskHistory.isEmpty()) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                "No past runs yet. Start an agent task to see its history here.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    } else {
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(taskHistory) { task ->
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                    )
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                task.goal,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            val statusColor = when (task.status) {
+                                                TaskStatus.COMPLETED -> MaterialTheme.colorScheme.primary
+                                                TaskStatus.FAILED -> MaterialTheme.colorScheme.error
+                                                TaskStatus.RUNNING -> MaterialTheme.colorScheme.secondary
+                                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            }
+                                            Text(
+                                                task.status,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = statusColor,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        val dateStr = remember(task.startedAt) {
+                                            java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
+                                                .format(java.util.Date(task.startedAt))
+                                        }
+                                        Text(
+                                            "$dateStr • ${task.stepCount} steps${if (task.wasSimulator) " • Simulator" else ""}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        task.resultMessage?.let { msg ->
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                msg,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
