@@ -124,6 +124,7 @@ object ApiClient {
         model: String,
         prompt: String,
         apiKey: String,
+        imageBase64: String? = null,
         onResponse: (success: Boolean, text: String, latencyMs: Long, endpointUrl: String, debugJson: String) -> Unit
     ) {
         val startTime = System.currentTimeMillis()
@@ -135,7 +136,28 @@ object ApiClient {
             when (provider) {
                 ApiProvider.GEMINI -> {
                     url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
-                    payloadJson = """
+                    payloadJson = if (imageBase64 != null) {
+                        """
+                        {
+                          "contents": [
+                            {
+                              "parts": [
+                                {
+                                  "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": "$imageBase64"
+                                  }
+                                },
+                                {
+                                  "text": ${escapeJsonString(prompt)}
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                        """.trimIndent()
+                    } else {
+                        """
                         {
                           "contents": [
                             {
@@ -147,7 +169,8 @@ object ApiClient {
                             }
                           ]
                         }
-                    """.trimIndent()
+                        """.trimIndent()
+                    }
                     val mediaType = "application/json; charset=utf-8".toMediaType()
                     val body = payloadJson.toRequestBody(mediaType)
                     requestBuilder.url(url).post(body)
@@ -726,6 +749,15 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
                 ?: "Screen elements empty. Ensure the 'Horizon Autonomous Controller' Accessibility Service is enabled in Settings."
         }
 
+        // Capture a live screenshot for vision-grounded decisions. Only available on a real
+        // device (not the simulator) with the Gemini provider, and only on Android 11+; falls
+        // back silently to text-only mode otherwise so the agent loop is never blocked by this.
+        val screenshotBase64 = if (!state.isSimulatorMode && activeProvider == ApiProvider.GEMINI) {
+            DeviceControlService.instance?.captureScreenshotBase64()
+        } else {
+            null
+        }
+
         val currentStepCount = state.agentLogs.filter { it.startsWith("👉") }.size + 1
         _uiState.update { it.copy(
             agentLogs = it.agentLogs + "👉 [Step $currentStepCount] Analyzing layout of screen & requesting model decision..."
@@ -735,7 +767,7 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
             You are an advanced Android OS Autonomous Automation Agent.
             Your current high-level goal is: "${state.agentGoal}"
 
-            Analyze the current screen layout below and output the single best NEXT action to move closer to the goal.
+            ${if (screenshotBase64 != null) "A screenshot of the current screen is attached as an image. Use it to visually confirm what each element in the tree below looks like and where it sits, especially when text labels alone are ambiguous." else "Analyze the current screen layout below and output the single best NEXT action to move closer to the goal."}
 
             AVAILABLE ACTIONS:
             1. Click on a coordinate: `[CLICK: x, y]`
@@ -752,11 +784,13 @@ class ChatViewModel(private val keyManager: KeyManager) : ViewModel() {
             CRITICAL INSTRUCTIONS:
             - You must output exactly ONE action in your response.
             - Do not output multiple actions in one step.
-            - Place the action at the very top of your response (e.g. `[CLICK: 540, 1100]`) followed by a brief 1-sentence thought explaining why you took this action.
-            - Ensure the coordinates match a visible button or field from the layout.
+            - Place the action at the very top of your response, followed by a brief 1-sentence thought explaining why you took this action.
+            - For CLICK actions: you MUST copy the x, y values verbatim from the `Bounds=(x, y)` shown next to the element you are targeting in the CURRENT SCREEN ELEMENT TREE above. Never invent, estimate, guess, or round coordinates. Find the exact line for the element you want, and use its exact Bounds=(x, y) pair as-is.
+            - Only target elements marked `[Clickable]` or `[Editable]`.
+            - If no element in the tree matches what you need, do not guess a coordinate — instead use [WAIT: 1] or [BACK] and explain why in your thought.
         """.trimIndent()
 
-        ApiClient.sendRequest(activeProvider, activeModel, finalPrompt, apiKey) { success, responseText, latency, url, debugJson ->
+        ApiClient.sendRequest(activeProvider, activeModel, finalPrompt, apiKey, screenshotBase64) { success, responseText, latency, url, debugJson ->
             val currentState = _uiState.value
             if (!currentState.isAgentRunning) return@sendRequest // Stopped in transition
 
